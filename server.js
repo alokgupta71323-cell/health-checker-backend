@@ -7,77 +7,72 @@ const dns = require("dns").promises;
 const net = require("net");
 
 const app = express();
+const PORT = process.env.PORT || 10000;
 
 app.use(cors());
 app.use(express.json({ limit: "1mb" }));
-
-const PORT = process.env.PORT || 10000;
 
 // Health Check
 app.get("/", (req, res) => {
     res.json({
         name: "Health Checker",
         status: "online",
-        version: "3.0"
+        version: "3.1"
     });
 });
 
-// Check for private/local IP addresses
+// Private IP Protection
 function isPrivateIP(ip) {
     if (net.isIPv4(ip)) {
-        const parts = ip.split(".").map(Number);
+        const p = ip.split(".").map(Number);
 
         return (
-            parts[0] === 10 ||
-            parts[0] === 127 ||
-            parts[0] === 0 ||
-            (parts[0] === 169 && parts[1] === 254) ||
-            (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31) ||
-            (parts[0] === 192 && parts[1] === 168
-            )
+            p[0] === 10 ||
+            p[0] === 127 ||
+            p[0] === 0 ||
+            (p[0] === 169 && p[1] === 254) ||
+            (p[0] === 172 && p[1] >= 16 && p[1] <= 31) ||
+            (p[0] === 192 && p[1] === 168)
         );
     }
 
     if (net.isIPv6(ip)) {
-        const normalized = ip.toLowerCase();
+        const value = ip.toLowerCase();
 
         return (
-            normalized === "::1" ||
-            normalized === "::" ||
-            normalized.startsWith("fe80:") ||
-            normalized.startsWith("fc") ||
-            normalized.startsWith("fd") ||
-            normalized.startsWith("::ffff:127.") ||
-            normalized.startsWith("::ffff:10.") ||
-            normalized.startsWith("::ffff:192.168.")
+            value === "::1" ||
+            value === "::" ||
+            value.startsWith("fe80:") ||
+            value.startsWith("fc") ||
+            value.startsWith("fd") ||
+            value.startsWith("::ffff:127.") ||
+            value.startsWith("::ffff:10.") ||
+            value.startsWith("::ffff:192.168.")
         );
     }
 
     return true;
 }
 
-// Validate website URL
+// URL Validation
 async function validateURL(input) {
-    let parsedURL;
+    let parsed;
 
     try {
-        parsedURL = new URL(input);
+        parsed = new URL(input);
     } catch {
         throw new Error("Please enter a valid website URL.");
     }
 
-    if (!["http:", "https:"].includes(parsedURL.protocol)) {
+    if (!["http:", "https:"].includes(parsed.protocol)) {
         throw new Error("Only HTTP and HTTPS websites are supported.");
     }
 
-    if (
-        parsedURL.username ||
-        parsedURL.password
-    ) {
-        throw new Error("URLs containing login credentials are not allowed.");
+    if (parsed.username || parsed.password) {
+        throw new Error("Website URLs containing credentials are not allowed.");
     }
 
-    const hostname = parsedURL.hostname.toLowerCase();
+    const hostname = parsed.hostname.toLowerCase();
 
     if (
         hostname === "localhost" ||
@@ -93,10 +88,10 @@ async function validateURL(input) {
             throw new Error("Private IP addresses cannot be analyzed.");
         }
     } else {
-        let addresses;
+        let records;
 
         try {
-            addresses = await dns.lookup(hostname, {
+            records = await dns.lookup(hostname, {
                 all: true,
                 verbatim: true
             });
@@ -104,26 +99,41 @@ async function validateURL(input) {
             throw new Error("Website domain could not be resolved.");
         }
 
-        if (!addresses.length) {
+        if (!records.length) {
             throw new Error("No IP address found for this website.");
         }
 
-        if (addresses.some((entry) => isPrivateIP(entry.address))) {
+        if (records.some(record => isPrivateIP(record.address))) {
             throw new Error("This website resolves to a private IP address.");
         }
     }
 
-    return parsedURL.href;
+    return parsed.href;
 }
 
-// Convert Lighthouse audits into simple explanations
+// Compatibility with different Chromium package API versions
+async function getChromiumPath() {
+    const path = chromium.executablePath;
+
+    if (typeof path === "function") {
+        return await path.call(chromium);
+    }
+
+    if (path) {
+        return await path;
+    }
+
+    throw new Error("Chromium executable path is unavailable.");
+}
+
+// Audit Issue Formatter
 function getAuditIssues(category) {
     if (!category || !category.auditRefs) {
         return [];
     }
 
     return category.auditRefs
-        .filter((ref) => {
+        .filter(ref => {
             const audit = ref.result;
 
             return (
@@ -134,7 +144,7 @@ function getAuditIssues(category) {
                 ref.weight > 0
             );
         })
-        .map((ref) => {
+        .map(ref => {
             const audit = ref.result;
 
             return {
@@ -147,15 +157,14 @@ function getAuditIssues(category) {
                     audit.displayValue ||
                     "This check did not achieve a perfect score.",
                 score: Math.round((audit.score || 0) * 100),
-                severity:
-                    audit.score <= 0.5 ? "High" : "Medium",
+                severity: audit.score <= 0.5 ? "High" : "Medium",
                 help: audit.details?.items || [],
                 learnMore: audit.description || ""
             };
         });
 }
 
-// Main Website Analysis API
+// Main Analysis API
 app.post("/analyze", async (req, res) => {
     let chrome;
 
@@ -164,6 +173,7 @@ app.post("/analyze", async (req, res) => {
 
         if (!url || typeof url !== "string") {
             return res.status(400).json({
+                success: false,
                 error: "Please enter a website URL."
             });
         }
@@ -178,9 +188,10 @@ app.post("/analyze", async (req, res) => {
 
         console.log("Starting analysis:", websiteURL);
 
-        // Launch Chromium
+        const executablePath = await getChromiumPath();
+
         chrome = await chromeLauncher.launch({
-            chromePath: await chromium.executablePath(),
+            chromePath: executablePath,
             chromeFlags: [
                 ...chromium.args,
                 "--no-sandbox",
@@ -191,49 +202,51 @@ app.post("/analyze", async (req, res) => {
             port: 0
         });
 
-        // Lighthouse is an ES module
         const lighthouseModule = await import("lighthouse");
         const lighthouse = lighthouseModule.default;
 
-        // Run Lighthouse
-        const report = await lighthouse(
-            websiteURL,
-            {
-                port: chrome.port,
-                output: "json",
-                logLevel: "error",
-                onlyCategories: [
-                    "performance",
-                    "seo",
-                    "accessibility"
-                ],
-                formFactor: "desktop",
-                screenEmulation: {
-                    mobile: false,
-                    width: 1350,
-                    height: 940,
-                    deviceScaleFactor: 1,
-                    disabled: false
-                }
+        const report = await lighthouse(websiteURL, {
+            port: chrome.port,
+            output: "json",
+            logLevel: "error",
+
+            onlyCategories: [
+                "performance",
+                "seo",
+                "accessibility"
+            ],
+
+            formFactor: "desktop",
+
+            screenEmulation: {
+                mobile: false,
+                width: 1350,
+                height: 940,
+                deviceScaleFactor: 1,
+                disabled: false
             }
-        );
+        });
 
         if (!report || !report.lhr) {
-            throw new Error("Lighthouse could not generate an audit report.");
+            throw new Error("Lighthouse could not generate a report.");
         }
 
         const lhr = report.lhr;
         const categories = lhr.categories;
         const audits = lhr.audits;
 
-        const performance = categories.performance;
-        const seo = categories.seo;
-        const accessibility = categories.accessibility;
-
         const scores = {
-            performance: Math.round((performance.score || 0) * 100),
-            seo: Math.round((seo.score || 0) * 100),
-            accessibility: Math.round((accessibility.score || 0) * 100)
+            performance: Math.round(
+                (categories.performance.score || 0) * 100
+            ),
+
+            seo: Math.round(
+                (categories.seo.score || 0) * 100
+            ),
+
+            accessibility: Math.round(
+                (categories.accessibility.score || 0) * 100
+            )
         };
 
         const metrics = {
@@ -257,9 +270,9 @@ app.post("/analyze", async (req, res) => {
         };
 
         const issues = {
-            performance: getAuditIssues(performance),
-            seo: getAuditIssues(seo),
-            accessibility: getAuditIssues(accessibility)
+            performance: getAuditIssues(categories.performance),
+            seo: getAuditIssues(categories.seo),
+            accessibility: getAuditIssues(categories.accessibility)
         };
 
         const totalIssues =
@@ -281,12 +294,11 @@ app.post("/analyze", async (req, res) => {
         });
 
     } catch (error) {
-        console.error("Analysis error:", error.message);
+        console.error("Analysis error:", error);
 
         return res.status(500).json({
             success: false,
-            error:
-                error.message ||
+            error: error.message ||
                 "Website analysis failed. Please try again."
         });
 
@@ -303,5 +315,5 @@ app.post("/analyze", async (req, res) => {
 
 // Start Server
 app.listen(PORT, "0.0.0.0", () => {
-    console.log(`Health Checker backend running on port ${PORT}`);
+    console.log(`Health Checker running on port ${PORT}`);
 });
