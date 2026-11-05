@@ -1,29 +1,40 @@
+
 const express = require("express");
 const cors = require("cors");
 const chromeLauncher = require("chrome-launcher");
+const chromium = require("@sparticuz/chromium");
 const dns = require("dns").promises;
 const net = require("net");
 
 const app = express();
-const PORT = process.env.PORT || 3000;
 
 app.use(cors());
-app.use(express.json({ limit: "10kb" }));
+app.use(express.json({ limit: "1mb" }));
 
-// Basic private/local IP protection
+const PORT = process.env.PORT || 10000;
+
+// Health Check
+app.get("/", (req, res) => {
+    res.json({
+        name: "Health Checker",
+        status: "online",
+        version: "3.0"
+    });
+});
+
+// Check for private/local IP addresses
 function isPrivateIP(ip) {
     if (net.isIPv4(ip)) {
         const parts = ip.split(".").map(Number);
 
         return (
-            parts[0] === 0 ||
             parts[0] === 10 ||
             parts[0] === 127 ||
-            parts[0] >= 224 ||
+            parts[0] === 0 ||
             (parts[0] === 169 && parts[1] === 254) ||
             (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31) ||
-            (parts[0] === 192 && parts[1] === 168) ||
-            (parts[0] === 100 && parts[1] >= 64 && parts[1] <= 127)
+            (parts[0] === 192 && parts[1] === 168
+            )
         );
     }
 
@@ -31,11 +42,11 @@ function isPrivateIP(ip) {
         const normalized = ip.toLowerCase();
 
         return (
-            normalized === "::" ||
             normalized === "::1" ||
+            normalized === "::" ||
+            normalized.startsWith("fe80:") ||
             normalized.startsWith("fc") ||
             normalized.startsWith("fd") ||
-            normalized.startsWith("fe80") ||
             normalized.startsWith("::ffff:127.") ||
             normalized.startsWith("::ffff:10.") ||
             normalized.startsWith("::ffff:192.168.")
@@ -45,23 +56,34 @@ function isPrivateIP(ip) {
     return true;
 }
 
-async function validatePublicURL(url) {
-    const parsed = new URL(url);
+// Validate website URL
+async function validateURL(input) {
+    let parsedURL;
 
-    if (!["http:", "https:"].includes(parsed.protocol)) {
+    try {
+        parsedURL = new URL(input);
+    } catch {
+        throw new Error("Please enter a valid website URL.");
+    }
+
+    if (!["http:", "https:"].includes(parsedURL.protocol)) {
         throw new Error("Only HTTP and HTTPS websites are supported.");
     }
 
-    if (parsed.username || parsed.password) {
-        throw new Error("URLs containing credentials are not allowed.");
+    if (
+        parsedURL.username ||
+        parsedURL.password
+    ) {
+        throw new Error("URLs containing login credentials are not allowed.");
     }
 
-    const hostname = parsed.hostname.toLowerCase();
+    const hostname = parsedURL.hostname.toLowerCase();
 
     if (
         hostname === "localhost" ||
         hostname.endsWith(".localhost") ||
-        hostname.endsWith(".local")
+        hostname.endsWith(".local") ||
+        hostname.endsWith(".internal")
     ) {
         throw new Error("Local websites cannot be analyzed.");
     }
@@ -70,238 +92,208 @@ async function validatePublicURL(url) {
         if (isPrivateIP(hostname)) {
             throw new Error("Private IP addresses cannot be analyzed.");
         }
+    } else {
+        let addresses;
 
-        return;
+        try {
+            addresses = await dns.lookup(hostname, {
+                all: true,
+                verbatim: true
+            });
+        } catch {
+            throw new Error("Website domain could not be resolved.");
+        }
+
+        if (!addresses.length) {
+            throw new Error("No IP address found for this website.");
+        }
+
+        if (addresses.some((entry) => isPrivateIP(entry.address))) {
+            throw new Error("This website resolves to a private IP address.");
+        }
     }
 
-    const addresses = await dns.lookup(hostname, {
-        all: true,
-        verbatim: true
-    });
-
-    if (!addresses.length) {
-        throw new Error("Website hostname could not be resolved.");
-    }
-
-    if (addresses.some(item => isPrivateIP(item.address))) {
-        throw new Error("Website resolves to a restricted IP address.");
-    }
+    return parsedURL.href;
 }
 
-// Home
-app.get("/", (req, res) => {
-    res.json({
-        name: "Health Checker",
-        status: "online",
-        version: "2.0"
-    });
-});
+// Convert Lighthouse audits into simple explanations
+function getAuditIssues(category) {
+    if (!category || !category.auditRefs) {
+        return [];
+    }
 
-// Website Analysis
+    return category.auditRefs
+        .filter((ref) => {
+            const audit = ref.result;
+
+            return (
+                audit &&
+                audit.score !== null &&
+                audit.score !== undefined &&
+                audit.score < 1 &&
+                ref.weight > 0
+            );
+        })
+        .map((ref) => {
+            const audit = ref.result;
+
+            return {
+                id: audit.id,
+                title: audit.title || "Website issue",
+                description:
+                    audit.description ||
+                    "This audit identified an issue that may affect your website.",
+                explanation:
+                    audit.displayValue ||
+                    "This check did not achieve a perfect score.",
+                score: Math.round((audit.score || 0) * 100),
+                severity:
+                    audit.score <= 0.5 ? "High" : "Medium",
+                help: audit.details?.items || [],
+                learnMore: audit.description || ""
+            };
+        });
+}
+
+// Main Website Analysis API
 app.post("/analyze", async (req, res) => {
     let chrome;
 
     try {
-        let url = req.body.url;
+        const { url } = req.body;
 
         if (!url || typeof url !== "string") {
             return res.status(400).json({
-                success: false,
-                error: "Please enter a valid website URL."
+                error: "Please enter a website URL."
             });
         }
 
-        url = url.trim();
+        let websiteURL = url.trim();
 
-        if (!/^https?:\/\//i.test(url)) {
-            url = "https://" + url;
+        if (!/^https?:\/\//i.test(websiteURL)) {
+            websiteURL = "https://" + websiteURL;
         }
 
-        let parsedUrl;
+        websiteURL = await validateURL(websiteURL);
 
-        try {
-            parsedUrl = new URL(url);
-        } catch {
-            return res.status(400).json({
-                success: false,
-                error: "The URL format is invalid."
-            });
-        }
+        console.log("Starting analysis:", websiteURL);
 
-        await validatePublicURL(url);
-
-        console.log("Analyzing:", url);
-
+        // Launch Chromium
         chrome = await chromeLauncher.launch({
+            chromePath: await chromium.executablePath(),
             chromeFlags: [
-                "--headless",
+                ...chromium.args,
                 "--no-sandbox",
                 "--disable-dev-shm-usage",
-                "--disable-gpu"
-            ]
+                "--disable-gpu",
+                "--disable-setuid-sandbox"
+            ],
+            port: 0
         });
 
-        console.log("Chrome launched. Starting Lighthouse...");
-
+        // Lighthouse is an ES module
         const lighthouseModule = await import("lighthouse");
         const lighthouse = lighthouseModule.default;
 
-        const result = await lighthouse(url, {
-            port: chrome.port,
-            output: "json",
-            logLevel: "error",
-
-            onlyCategories: [
-                "performance",
-                "seo",
-                "accessibility"
-            ],
-
-            formFactor: "desktop",
-
-            screenEmulation: {
-                disabled: true
+        // Run Lighthouse
+        const report = await lighthouse(
+            websiteURL,
+            {
+                port: chrome.port,
+                output: "json",
+                logLevel: "error",
+                onlyCategories: [
+                    "performance",
+                    "seo",
+                    "accessibility"
+                ],
+                formFactor: "desktop",
+                screenEmulation: {
+                    mobile: false,
+                    width: 1350,
+                    height: 940,
+                    deviceScaleFactor: 1,
+                    disabled: false
+                }
             }
-        });
+        );
 
-        if (!result || !result.lhr) {
-            throw new Error("Lighthouse report unavailable.");
+        if (!report || !report.lhr) {
+            throw new Error("Lighthouse could not generate an audit report.");
         }
 
-        const report = result.lhr;
-        const categories = report.categories;
-        const reportAudits = report.audits;
+        const lhr = report.lhr;
+        const categories = lhr.categories;
+        const audits = lhr.audits;
 
-        // Convert Lighthouse scores into percentages
-        function getScore(category) {
-            const score = categories[category]?.score;
+        const performance = categories.performance;
+        const seo = categories.seo;
+        const accessibility = categories.accessibility;
 
-            return score == null
-                ? null
-                : Math.round(score * 100);
-        }
-
-        // Category mapping for individual audits
-        const auditCategories = {};
-
-        Object.entries(categories).forEach(([categoryName, category]) => {
-            category.auditRefs?.forEach(ref => {
-                auditCategories[ref.id] = categoryName;
-            });
-        });
-
-        // Detailed failed audits
-        const audits = Object.values(reportAudits)
-            .filter(audit =>
-                audit.score !== null &&
-                audit.score < 1 &&
-                audit.title
-            )
-            .map(audit => ({
-                id: audit.id,
-
-                title: audit.title,
-
-                description: audit.description || "",
-
-                score: audit.score,
-
-                displayValue: audit.displayValue || "",
-
-                category:
-                    auditCategories[audit.id] ||
-                    audit.details?.type ||
-                    "general",
-
-                scoreDisplayMode:
-                    audit.scoreDisplayMode || "numeric",
-
-                numericValue:
-                    audit.numericValue ?? null,
-
-                numericUnit:
-                    audit.numericUnit || "",
-
-                details:
-                    audit.details || null,
-
-                warnings:
-                    audit.warnings || [],
-
-                errorMessage:
-                    audit.errorMessage || null
-            }));
-
-        // Core Web Vitals and performance metrics
-        function getMetric(id) {
-            const audit = reportAudits[id];
-
-            if (!audit) {
-                return null;
-            }
-
-            return {
-                value: audit.numericValue ?? null,
-                displayValue: audit.displayValue || "",
-                score: audit.score ?? null,
-                description: audit.description || ""
-            };
-        }
+        const scores = {
+            performance: Math.round((performance.score || 0) * 100),
+            seo: Math.round((seo.score || 0) * 100),
+            accessibility: Math.round((accessibility.score || 0) * 100)
+        };
 
         const metrics = {
-            lcp: getMetric("largest-contentful-paint"),
-            cls: getMetric("cumulative-layout-shift"),
-            fcp: getMetric("first-contentful-paint"),
-            tbt: getMetric("total-blocking-time"),
-            speedIndex: getMetric("speed-index"),
-            inp: getMetric("interaction-to-next-paint")
+            firstContentfulPaint:
+                audits["first-contentful-paint"]?.displayValue || "N/A",
+
+            largestContentfulPaint:
+                audits["largest-contentful-paint"]?.displayValue || "N/A",
+
+            speedIndex:
+                audits["speed-index"]?.displayValue || "N/A",
+
+            totalBlockingTime:
+                audits["total-blocking-time"]?.displayValue || "N/A",
+
+            cumulativeLayoutShift:
+                audits["cumulative-layout-shift"]?.displayValue || "N/A",
+
+            timeToInteractive:
+                audits["interactive"]?.displayValue || "N/A"
         };
 
-        const response = {
+        const issues = {
+            performance: getAuditIssues(performance),
+            seo: getAuditIssues(seo),
+            accessibility: getAuditIssues(accessibility)
+        };
+
+        const totalIssues =
+            issues.performance.length +
+            issues.seo.length +
+            issues.accessibility.length;
+
+        console.log("Analysis completed:", websiteURL);
+
+        return res.json({
             success: true,
-
-            url: report.finalDisplayedUrl,
-
-            requestedUrl: url,
-
-            fetchTime: new Date().toISOString(),
-
-            lighthouseVersion: report.lighthouseVersion,
-
-            environment: {
-                formFactor: report.configSettings?.formFactor || "desktop",
-                throttlingMethod:
-                    report.configSettings?.throttlingMethod || "unknown"
-            },
-
-            performance: getScore("performance"),
-
-            seo: getScore("seo"),
-
-            accessibility: getScore("accessibility"),
-
+            website: websiteURL,
+            title: lhr.finalDisplayedUrl || websiteURL,
+            scores,
             metrics,
-
-            audits
-        };
-
-        console.log("Analysis completed successfully!");
-
-        res.json(response);
+            issues,
+            totalIssues,
+            analyzedAt: new Date().toISOString()
+        });
 
     } catch (error) {
         console.error("Analysis error:", error.message);
 
-        res.status(500).json({
+        return res.status(500).json({
             success: false,
-            error: error.message || "Website analysis failed."
+            error:
+                error.message ||
+                "Website analysis failed. Please try again."
         });
 
     } finally {
         if (chrome) {
             try {
                 await chrome.kill();
-                console.log("Chrome closed.");
             } catch (error) {
                 console.error("Chrome cleanup error:", error.message);
             }
@@ -309,6 +301,7 @@ app.post("/analyze", async (req, res) => {
     }
 });
 
+// Start Server
 app.listen(PORT, "0.0.0.0", () => {
-    console.log(`Health Checker running on port ${PORT}`);
+    console.log(`Health Checker backend running on port ${PORT}`);
 });
